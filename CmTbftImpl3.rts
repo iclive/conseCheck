@@ -1,0 +1,382 @@
+﻿#import "PAT.Lib.ChainMakerTBFT";
+
+//// 常量定义
+//	 节点数量
+#define N 4;
+
+//	 目标共识高度
+#define TARGET 2;
+
+//   投票类型
+#define Vote_Type_Prevote 1;
+#define Vote_Type_Precommit 2;
+
+//   消息类型
+#define MsgTypeProposal  1;
+#define MsgTypePrevote   2;
+#define MsgTypePrecommit 3;
+
+//   共识步骤
+#define 	Step_NEW_HEIGHT		0;
+#define 	Step_NEW_ROUND  	1;
+#define 	Step_PROPOSE        2;
+#define 	Step_PREVOTE        3;
+#define 	Step_PREVOTE_WAIT   4;
+#define 	Step_PRECOMMIT      5;
+#define 	Step_PRECOMMIT_WAIT 6;
+#define 	Step_COMMIT         7;
+
+//   超时时间
+#define 	consensusTimeout			3;	// 共识模块默认超时时间
+#define 	corruptLowerTimeout			2;	// 网络延迟，小于超时时间
+#define 	corruptHigherTimeout		4;	// 网络延迟，大于超时时间
+#define		defaultConnTime				1;	// 网络传输默认时间
+
+//   攻击场景
+#define     CorruptProposerLowerTimeout  			 	1;	// 网络延时攻击【小于超时时间】-仅提议节点被攻击
+#define     CorruptProposerAndValidatorLowerTimeout 	2;	// 网络延时攻击【小于超时时间】-提议节点和小于 f 个验证节点被攻击
+#define		CorruptValidatorLowerTimeout				3;	// 网络延时攻击【小于超时时间】-仅小于等于 f 个验证节点被攻击
+#define		CorruptProposerHeigherTimeout				4;  // 网络延时攻击【大于超时时间】-仅提议节点被攻击
+#define		CorruptProposerAndValidatorHigherTimeout	5;	// 网络延时攻击【大于超时时间】-提议节点和小于 f 个验证节点被攻击
+#define 	CorruptValidatorHigherTimeout				6;	// 网络延时攻击【大于超时时间】-仅小于等于 f 个验证节点被攻击
+#define 	DisguiseProposer							7;	// 伪装提议者攻击（攻击者提案发送给部分节点）
+#define		DisguiseProposer2							8;  // 伪装提议者攻击（攻击者提案发送所有节点）
+
+//// 全局变量定义
+// 	 节点列表
+var<ConsensusNodes> nodes;
+
+// 	 创世区块 
+var<Block> genesisBlock = new Block(1,0,0,1,0,1,1);
+
+//   各节点提议的最新提案
+var<ProposalList> proposals;
+
+//   各节点生成的最新prevote 投票
+var<VoteList> prevotes;
+
+//   各节点生成的最新precommit 投票
+var<VoteList> precommits;
+
+//   当前模拟的攻击场景
+var attackCase = 0;
+
+//   攻击者与节点交互通道(用于发送网络延迟信息)
+channel corruptChannel[N] 0;
+
+//// 通道定义
+//   模拟网络通道
+channel msgCh[N*N] 0;
+
+channel receivedProposalCh[N] 0;
+channel enterPrevoteCh[N] 0;
+
+channel majorityPrevoteCh[N] 0;
+channel enterPrecommitCh[N] 0;
+
+channel majorityPrecommitCh[N] 0;
+channel enterCommitCh[N] 0;
+
+//// 数组定义
+//   超时数组，用于记录每个节点最新一轮共识的超时时间
+var nodeTimeout[N];
+
+
+//// 行为定义
+//   初始化共识委员会
+InitConsensus() = initConsenus{
+	// 根据节点数量初始化共识节点列表
+	nodes = new ConsensusNodes();
+	var i = 0;
+	while (i < N) {
+		// 节点所属链的chainId为固定值：1， 节点的ID为节点在列表中的序号，从0开始
+		// 参数1： 联盟链ID
+		// 参数2： 节点ID
+		// 参数3： 节点当前高度
+		// 参数4： 节点当前轮数
+		// 参数5： 共识节点个数
+		// 参数6： 上一个区块的提议者ID
+		// 参数7： 最新区块的提议者ID
+		var node = new ConsensusNode(1, i, 0, 0, N,0,0);
+		nodes.addConsensusNode(node);
+		nodeTimeout[i] = consensusTimeout;
+		i++;
+	}
+}->Skip deadline[0];
+
+// 启动节点共识模块
+StartConsensus(nodeId, gb) = ProcessBlock(nodeId,nodes.getByKey(nodeId),gb) ||| StartListenner(nodeId);
+
+// 处理区块
+ProcessBlock(nodeId,node,block) = processBlock{
+	node.processBlock(block);
+}->Skip deadline[0];NewHeight(nodeId,node, block.getHeight()+1);
+
+// 开启新高度的共识
+NewHeight(nodeId, node, height) = newHeight{
+	node.newHeight(height);
+	node.setStep(Step_NEW_HEIGHT);
+}->Skip deadline[0];NewRound(nodeId, node, height, 0);
+
+// 开启新轮次的共识
+NewRound(nodeId, node, height, round) = newRound{
+	node.setStep(Step_NEW_ROUND);
+	node.newRound(height, round);
+	nodeTimeout[nodeId] = consensusTimeout+round;
+}->Skip deadline[0]; MockCorrupt(nodeId, node, height, round);
+
+// 模拟攻击者向节点发送延迟消息
+MockCorrupt(nodeId, node, height, round) = (
+	Corrupt(nodeId, height, round, node.getLastProposer()) 
+	||| 
+	Corrupted(nodeId, node, height, round) 
+) deadline[0];ProposeBlock(nodeId, node, height, round, node.getLastProposer());
+
+// 根据测试场景，对共识节点发送响应的网络延迟时间
+Corrupt(nodeId, h, r, lp) = case{
+	(attackCase == CorruptProposerLowerTimeout): SendCorruptToProposer(nodeId, corruptLowerTimeout, h, r ,lp)
+	(attackCase == CorruptProposerAndValidatorLowerTimeout): SendCorruptToProposerAndValidator(nodeId, corruptLowerTimeout, h, r ,lp)
+	(attackCase == CorruptValidatorLowerTimeout): SendCorruptToValidator(nodeId, corruptLowerTimeout, h, r ,lp)
+	(attackCase == CorruptProposerHeigherTimeout): SendCorruptToProposer(nodeId, corruptHigherTimeout, h, r ,lp)
+	(attackCase == CorruptProposerAndValidatorHigherTimeout): SendCorruptToProposerAndValidator(nodeId, corruptHigherTimeout, h, r ,lp)
+	(attackCase == CorruptValidatorHigherTimeout): SendCorruptToValidator(nodeId, corruptHigherTimeout, h, r ,lp)
+	default: SendCorruptToNone(nodeId)
+} within[0];
+
+// 不延迟（默认通信时间为 1 个时间单位）
+SendCorruptToNone(nodeId) = corruptChannel[nodeId]!defaultConnTime->Skip within[0];
+
+// 仅向提议节点发送延迟消息（默认通信时间为 1 个时间单位）
+SendCorruptToProposer(nodeId,delay, h, r ,lp) = ifa(nodeId == call(NextProposer,lp,h,r, N)){
+	corruptChannel[nodeId]!delay->Skip
+} else{
+	corruptChannel[nodeId]!defaultConnTime->Skip
+} within[0];
+
+// 同时向提议节点、部分验证节点发送延迟消息
+SendCorruptToProposerAndValidator(nodeId,delay, h, r ,lp) = ifa(nodeId == call(NextProposer,lp,h,r, N) || nodeId == (call(NextProposer,lp,h,r, N)+1)%N){
+	corruptChannel[nodeId]!delay->Skip
+} else{
+	corruptChannel[nodeId]!defaultConnTime->Skip
+} within[0];
+
+// 仅向部分验证节点发送延迟消息
+SendCorruptToValidator(nodeId, delay, h, r ,lp) = ifa(nodeId == (call(NextProposer,lp,h,r, N)+1)%N){
+	corruptChannel[nodeId]!delay->Skip
+} else{
+	corruptChannel[nodeId]!defaultConnTime->Skip
+} within[0];
+
+// 模拟各节点收到攻击者的延迟信息
+Corrupted(nodeId, node, height, round) = corruptChannel[nodeId]?delay->saveDelayTime{
+	node.setDelayTime(height,round,delay);
+}->Skip;
+
+// 提议提案阶段
+ProposeBlock(nodeId,node, height, round, lastProposer) = propose{node.setStep(Step_PROPOSE);}
+->if(node.needGenProposal(height, round, (attackCase == DisguiseProposer || attackCase == DisguiseProposer2)) == 1){
+	GenerateProposal(node,nodeId,height,round)
+}else{
+	Skip
+} deadline[0];atomic{if(attackCase == DisguiseProposer && node.isDisguiser(height, round) == 1){
+	(WaitProposal(nodeId) ||| SendMessage(nodeId, proposals.getProposal(nodeId, height, round), defaultConnTime, (nodeId+1)%N) ||| Prevote(nodeId, node, height, round))
+}else{
+	(WaitProposal(nodeId) ||| BroadcastMessage(nodeId, proposals.getProposal(nodeId, height, round), node.getDelayTime(height,round)) ||| Prevote(nodeId, node, height, round))
+} };//within[0];
+
+// 生成提案信息
+GenerateProposal(node, nodeId, height, round) = generateProposal{
+	var proposal = node.generateProposal();
+	proposals.addProposal(nodeId,height,round,proposal);
+}->Skip;
+
+// 节点等待提议节点发送的提案
+WaitProposal(nodeId) = atomic{
+	receivedProposalCh[nodeId]?ps
+	->procProposal{
+		var a = 0;
+	}->enterPrevoteCh[nodeId]!1->Skip 
+} timeout[nodeTimeout[nodeId]] enterPrevoteCh[nodeId]!0->Skip within[0];
+
+// 生成prevote投票信息
+Prevote(nodeId, node, height, round) = atomic{enterPrevoteCh[nodeId]?f->prevote{
+	node.setStep(Step_PREVOTE);
+	var prevote = node.generatePreVote(f);
+	prevotes.addVote(nodeId, height, round, prevote);
+	node.setStep(Step_PREVOTE_WAIT);
+}->Skip 
+; (WaitPrevote(nodeId, node) ||| BroadcastMessage(nodeId, prevotes.getByKey(nodeId, height, round),node.getDelayTime(height,round)) |||  Precommit(nodeId, node, height, round))};
+
+// 收集其他节点发送的 prevote 投票信息
+WaitPrevote(nodeId, node) = atomic{
+	majorityPrevoteCh[nodeId]?pv->{
+		node.setStep(Step_PRECOMMIT);
+	}
+	->enterPrecommitCh[nodeId]!1->Skip
+} timeout[nodeTimeout[nodeId]] enterPrecommitCh[nodeId]!0->Skip within[0];
+
+// 生成precommit投票信息
+Precommit(nodeId, node, height, round) = atomic{enterPrecommitCh[nodeId]?f->
+	precommit{
+		var precommit = node.generatePreCommit(f);
+		precommits.addVote(nodeId, height, round,precommit);
+		node.setStep(Step_PRECOMMIT_WAIT);
+	}->Skip; (
+		WaitPrecommit(nodeId, node) 
+		||| 
+		BroadcastMessage(nodeId,precommits.getByKey(nodeId, height, round),node.getDelayTime(height,round)) 
+		|||  
+		Commit(nodeId, node, height, round))
+};
+
+// 收集其他节点发送的 precommit 投票信息
+WaitPrecommit(nodeId, node) = atomic{
+	majorityPrecommitCh[nodeId]?pc
+	->waitPrecommit{
+		node.setStep(Step_COMMIT);
+	}->enterCommitCh[nodeId]!1->Skip
+} timeout[nodeTimeout[nodeId]] enterCommitCh[nodeId]!0->Skip within[0];
+
+// 提交共识
+Commit(nodeId, node, height, round) = enterCommitCh[nodeId]?f->
+if(f == 1 && node.isNilConsensus(height,round,Step_COMMIT) != 1){ 
+	// 正常收集到大多数投票，则提交区块
+	CommitBlock(nodeId, node)
+}else {
+	// 如果收集precommit超时或precommit 是对空hash 的投票； 则进入下一轮
+	NewRound(nodeId, node, height, round+1)
+};
+
+// 提交共识区块
+CommitBlock(nodeId, node) = commit{
+	node.commitBlock();
+}->if(node.reachTarget(TARGET) == 1){  // 判断是否达到目标高度，如果达到则结束共识
+	BroadcastMessage(nodeId, -1, 0)
+}else{ // 如果未达到目标高度，则开始下一高度的共识
+	ProcessBlock(nodeId,node,node.getProposalBlock())
+};
+
+// 启动通道监听进程，循环读取节点间的通信数据
+StartListenner(nodeId) = |||sender:{0..N-1}@OnMessage(nodeId,nodes.getByKey(nodeId), sender);
+
+// 接收网络消息
+OnMessage(nodeId,node, sender) = atomic{
+	msgCh[nodeId+sender*N]?msg
+	->if (call(MsgType,msg) == MsgTypeProposal){ 		// 收到 proposal 信息
+			if(node.noProposal() == 1){
+				saveProposal{
+					node.setProposal(msg);
+				}->receivedProposalCh[nodeId]!1->Skip
+			}else{
+				Skip
+			};OnMessage(nodeId, node, sender)
+		}else if(call(MsgType,msg) == MsgTypePrevote) { // 收到 prevote 信息
+			savePrevote{
+				node.savePrevote(msg);
+			}->IsPrevoteMajority(nodeId, node);OnMessage(nodeId, node, sender)
+		} else if(call(MsgType,msg) == MsgTypePrecommit){  // 收到 precommit 信息
+			savePrecommit{
+				node.savePrecommit(msg);
+			}->IsPrecommitMajority(nodeId,node);OnMessage(nodeId,node, sender)
+		} else {
+			Skip
+		}
+};
+
+// 判断是否收集到2f+1 个prevote 投票
+IsPrevoteMajority(nodeId, node) = ifa(node.isMajorityPrevotes()  == 1 && node$step == Step_PREVOTE_WAIT){
+	majorityPrevoteCh[nodeId]!1->Skip
+}else{
+	Skip
+};
+
+// 判断是否收集到2f+1个 precommit 投票
+IsPrecommitMajority(nodeId,node) = ifa(node.isMajorityPrecommits() == 1 &&  node$step == Step_PRECOMMIT_WAIT){
+	majorityPrecommitCh[nodeId]!1->Skip
+}else{
+	Skip
+};
+
+// 广播消息
+BroadcastMessage(nodeId, msg, delay) = atomic{ 
+if(call(MsgType, msg) != 0){   // 判断消息类型，如果类型为 0 为无效信息，则不发送
+	(Wait[delay];(|||receiver:{0..N-1}@msgCh[nodeId*N+receiver]!msg->Skip) within[0])
+}else{
+	Skip
+}  timeout[nodeTimeout[nodeId]] Skip};  // 为消息发送添加超时时间，如果超过时间未能发送则丢弃消息
+
+// 向指定节点发送消息
+SendMessage(nodeId, msg, delay,to) = atomic{
+	(Wait[delay];(msgCh[nodeId*N+nodeId]!msg->Skip ||| msgCh[nodeId*N+to]!msg->Skip) within[0]) timeout[nodeTimeout[nodeId]] Skip
+};
+
+// 设置攻击场景
+SetCorruptcase(c) = (setAttackCase{attackCase = c;}->Skip within[0]) deadline[0];
+
+//// 模拟进程
+//   正常共识模拟进程
+Consensus() = InitConsensus();(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+
+//   仅Proposer节点被延时（低于系统超时时间）
+ConsensusOnlyProposerCorruptL() = InitConsensus();SetCorruptcase(CorruptProposerLowerTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   仅小于f个Validator被延时（低于系统超时时间）
+ConsensusOnlyValidatorCorruptL() = InitConsensus(); SetCorruptcase(CorruptValidatorLowerTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   Proposer 和 小于f-1个Validator被延时（低于系统超时时间）
+ConsensusProposerAndOneValidatorCorruptL() = InitConsensus(); SetCorruptcase(CorruptProposerAndValidatorLowerTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+
+//   仅Proposer节点被延时（高于系统超时时间）
+ConsensusOnlyProposerCorruptH() = InitConsensus(); SetCorruptcase(CorruptProposerHeigherTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   仅小于f个Validator被延时（高于系统超时时间）
+ConsensusOnlyValidatorCorruptH() = InitConsensus(); SetCorruptcase(CorruptValidatorHigherTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   Proposer 和 小于f-1个Validator被延时（高于系统超时时间）
+ConsensusProposerAndOneValidatorCorruptH() = InitConsensus(); SetCorruptcase(CorruptProposerAndValidatorHigherTimeout);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   伪装提议节点(伪装者提案发送给部分节点)
+ConsensuDisguiseProposer() = InitConsensus(); SetCorruptcase(DisguiseProposer);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+//   伪装提议节点(伪装者提案发送给所有节点)
+ConsensuDisguiseProposer2() = InitConsensus(); SetCorruptcase(DisguiseProposer2);(|||i:{0..N-1}@StartConsensus(i, genesisBlock));
+
+// 验证条件
+// 判断共识节点中是否有超过 2/3 的节点达到目标高度
+#define target  (nodes.reachTargetHeight(TARGET) == 1 );
+
+// 判断高度为1的区块，其区块hash是否为恶意节点提议的区块（1：诚实节点提议的区块， 2：恶意节点提议的区块）
+#define DisguiseBlock (nodes.MajorityBlockHash(1) == 2);
+
+// 判断节点不存在超时情况（ 0：不出现超时  1：出现超时）
+#define HasTimeout (nodes.hasTimeout() == 0);
+
+//// 检测校验
+// 正常共识进程的可达性检测
+#assert Consensus() reaches target;
+
+// 验证仅当Proposer被腐蚀时(高于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusOnlyProposerCorruptH() reaches target;
+
+// 验证仅当一个Validator被腐蚀时(高于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusOnlyValidatorCorruptH() reaches target;
+
+// 验证当Proposer和一个Validator被腐蚀时(高于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusProposerAndOneValidatorCorruptH() reaches target;
+
+// 验证仅当Proposer被腐蚀时(低于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusOnlyProposerCorruptL() reaches target;
+
+// 验证仅当一个Validator被腐蚀时(低于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusOnlyValidatorCorruptL() reaches target;
+
+// 验证当Proposer和一个Validator被腐蚀时(低于 超时时间)，共识协议最终是否能达成共识
+#assert ConsensusProposerAndOneValidatorCorruptL() reaches target;
+
+//--------------攻击节点伪装成提议节点， 并发送提案给所有验证节点---------------------
+// 验证是否能够达成共识 （通过：能达成共识  未通过：不能达成共识）
+#assert ConsensuDisguiseProposer2() reaches target;
+
+// 验证共识出的区块是否是由伪装者提议的(通过：伪装者提议区块  未通过：诚实节点提议区块)
+#assert ConsensuDisguiseProposer2() reaches DisguiseBlock;
+
+//--------------攻击节点伪装成提议节点， 并发送提案给部分验证节点---------------------
+// 验证是否能够达成共识 （通过：能达成共识  未通过：不能达成共识）
+#assert ConsensuDisguiseProposer() reaches target;
+
+// 验证共识过程中是否出现超时（通过： 未出现超时， 不通过：出现超时）
+#assert ConsensuDisguiseProposer() |= []HasTimeout;

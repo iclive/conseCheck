@@ -1,0 +1,424 @@
+﻿#import "PAT.Lib.basicHotStuff"; 
+
+#define N 4;	// number of nodes
+#define R 2;	// number of rounds
+#define MINORITY 1;
+#define HALF 2;
+#define MAJORITY 3;
+
+
+channel c01 0;
+channel c02 0;
+channel c03 0;
+channel c10 0;
+channel c12 0;
+channel c13 0;
+channel c20 0;
+channel c21 0;
+channel c23 0;	
+channel c30 0;
+channel c31 0;
+channel c32 0;//不同节点间的通信信道
+
+var signature0 = new Signature(0);
+var signature1 = new Signature(1);
+var signature2 = new Signature(2);	
+var signature3 = new Signature(3);
+
+
+// global variables
+var round = 1;
+var leader = 0;
+var voteCounter = 0;
+var<Block> proposedBlock;
+var<ProposalList> proposalList;
+var<VoteSet> prevote0;
+var<VoteSet> prevote1;
+var<VoteSet> prevote2;
+var<VoteSet> prevote3;
+var<VoteSet> precommitVote0;
+var<VoteSet> precommitVote1;
+var<VoteSet> precommitVote2;
+var<VoteSet> precommitVote3;
+var<BlockChain> chain0;
+var<BlockChain> chain1;
+var<BlockChain> chain2;
+var<BlockChain> chain3;
+
+
+// temporary global variables
+var<Block> parentBlock;
+var parentHash;
+var<QC> highQC;
+var<Proposal> tmpProposal;
+var<Block> tmpProposedBlock;
+
+var lockedHash0 = 0;
+var tmpProposedBlockParentHash0;
+var<Block> tmpProposedBlock0;
+var<Proposal> tmpProposal0;
+var<Vote> tmpVote0;
+
+var lockedHash1 = 0;
+var tmpProposedBlockParentHash1;
+var<Block> tmpProposedBlock1;
+var<Proposal> tmpProposal1;
+var<Vote> tmpVote1;
+
+var lockedHash2 = 0;
+var tmpProposedBlockParentHash2;
+var<Block> tmpProposedBlock2;
+var<Proposal> tmpProposal2;
+var<Vote> tmpVote2;
+
+var lockedHash3 = 0;
+var tmpProposedBlockParentHash3;
+var<Block> tmpProposedBlock3;
+var<Proposal> tmpProposal3;
+var<Vote> tmpVote3;
+
+//// 超时时间
+#define 	consensusTimeout 3;
+#define 	corruptTime	2;
+//// 存储被腐蚀节点的延迟时间
+var corrupt[N];
+//// 攻击者与共识节点交互通道
+channel corruptChannel[N] 0;
+
+// 模拟攻击者对Proposer发起腐蚀操作
+//Corrupt() = {corrupt[0] = corruptTime;} -> Skip;
+Corrupt() = corruptChannel[leader]!corruptTime -> Skip;
+
+/* Step 1 - Prepare Phase: 在每个视图中，领导者（Leader）形成一个新的区块提案，并将该区块发送给所有验证者。
+验证者在接收到区块后，验证该区块的有效性，对该区块进行投票并将投票结果返回给领导者。*/
+
+PrepareLeader(i) = 
+	[leader == i] corruptChannel[leader]?d ->>{
+		parentHash = 0;
+		proposedBlock = new Block(round * 10, parentHash);
+		proposalList.Set(i, new Proposal(proposedBlock, new Signature(i)));
+		corrupt[i] = d;
+	} 
+	-> Wait[corrupt[(i)]];((
+			[i == 0] (c01!proposalList.Get(i) -> Skip || c02!proposalList.Get(i) -> Skip || c03!proposalList.Get(i) -> Skip) []
+			[i == 1] (c10!proposalList.Get(i) -> Skip || c12!proposalList.Get(i) -> Skip || c13!proposalList.Get(i) -> Skip) []
+			[i == 2] (c20!proposalList.Get(i) -> Skip || c21!proposalList.Get(i) -> Skip || c23!proposalList.Get(i) -> Skip) []
+			[i == 3] (c30!proposalList.Get(i) -> Skip || c31!proposalList.Get(i) -> Skip || c32!proposalList.Get(i) -> Skip)
+		); Skip)
+	[]
+	[i == 0 && i != leader] (if (leader == 1){c10?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 2){c20?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 3){c30?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip})
+	[]
+    [i == 1 && i != leader] (if (leader == 0){c01?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 2){c21?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 3){c31?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}) 
+	[]
+    [i == 2 && i != leader] (if (leader == 0){c02?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 1){c12?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 3){c32?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}) 
+	[]
+	[i == 3 && i != leader] (if (leader == 0){c03?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 1){c13?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip}else if(leader == 2){c23?y -> {proposalList.Set(i, y)} -> Skip timeout[consensusTimeout] Skip});
+
+
+
+PrepareRep(i) = 
+	[i == 0] prepareVote -> Prevote_0(); (
+								if (leader == 0) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} timeout[consensusTimeout] Skip}
+								else if (leader == 1) {(c01!tmpVote0 -> Skip) || (c01?y -> { prevote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c02!tmpVote0 -> Skip) || (c02?y -> { prevote2.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c03!tmpVote0 -> Skip) || (c03?y -> { prevote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 1] prepareVote -> Prevote_1(); (
+								if (leader == 1) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} timeout[consensusTimeout] Skip}
+								else if (leader == 0) {(c10!tmpVote1 -> Skip) || (c10?y -> { prevote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c12!tmpVote1 -> Skip) || (c12?y -> { prevote2.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c13!tmpVote1 -> Skip) || (c13?y -> { prevote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 2] prepareVote -> Prevote_2(); (
+								if (leader == 2) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} timeout[consensusTimeout] Skip}
+								else if (leader == 0) {(c20!tmpVote2 -> Skip) || (c20?y -> { prevote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 1) {(c21!tmpVote2 -> Skip) || (c21?y -> { prevote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c23!tmpVote2 -> Skip) || (c23?y -> { prevote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 3] prepareVote -> Prevote_3(); (
+								if (leader == 3) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} timeout[consensusTimeout] Skip}
+								else if (leader == 0) {(c30!tmpVote3 -> Skip) || (c30?y -> { prevote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 1) {(c31!tmpVote3 -> Skip) || (c31?y -> { prevote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c32!tmpVote3 -> Skip) || (c32?y -> { prevote2.Add(y) } -> {voteCounter++;} -> Skip)}
+							);
+
+Prevote_0() = 
+	prepareValidateProposal.0 {
+		tmpProposal0 = proposalList.Get(0); 
+		tmpProposedBlock0 = tmpProposal0.GetBlock();
+		var invalid = false;
+		if(chain0.Contains(tmpProposedBlock0)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock0 = new Block();
+		}
+		tmpVote0 = new Vote(tmpProposedBlock0.GetHash(), signature0);
+		prevote0.Add(tmpVote0);
+	}  -> Skip;
+	
+Prevote_1() = 
+	prepareValidateProposal.1 {
+		tmpProposal1 = proposalList.Get(1); 
+		tmpProposedBlock1 = tmpProposal1.GetBlock();
+		var invalid = false;
+		if(chain1.Contains(tmpProposedBlock1)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock1 = new Block();	
+		}
+		tmpVote1 = new Vote(tmpProposedBlock1.GetHash(), signature1);
+		prevote1.Add(tmpVote1);
+	} -> Skip;
+
+Prevote_2() = 
+	prepareValidateProposal.2 {
+		tmpProposal2 = proposalList.Get(2); 
+		tmpProposedBlock2 = tmpProposal2.GetBlock();
+		var invalid = false;
+		if(chain2.Contains(tmpProposedBlock2)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock2 = new Block();	
+		}
+		tmpVote2 = new Vote(tmpProposedBlock2.GetHash(), signature2);
+		prevote2.Add(tmpVote2);
+	} ->  Skip;
+	
+Prevote_3() = 
+	prepareValidateProposal.3 {
+		tmpProposal3 = proposalList.Get(3); 
+		tmpProposedBlock3 = tmpProposal3.GetBlock();
+		var invalid = false;
+		if(chain3.Contains(tmpProposedBlock3)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock3 = new Block();	
+		}
+		tmpVote3 = new Vote(tmpProposedBlock3.GetHash(), signature3);
+		prevote3.Add(tmpVote3);
+	} ->  Skip;
+
+/* Step 2 - Precommit Phase: 在预备阶段达成足够多的投票后（通常是超过三分之二的验证者同意），领导者会进入预提交阶段。
+领导者将包含足够多投票的投票证据（QC）广播给所有验证者，表示区块已经获得了大多数节点的同意。*/
+
+PrecommitLeader(i) = 
+	[leader == i] precommitLeader.i {
+		if(i == 0) {
+			tmpProposedBlock = prevote0.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(0)));// 需要改为qc而不是0的签名
+		};
+		if(i == 1) {
+			tmpProposedBlock = prevote1.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(1)));
+		};
+		if(i == 2) {
+			tmpProposedBlock = prevote2.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(2)));
+		};
+		if(i == 3) {
+			tmpProposedBlock = prevote3.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(3)));
+		};
+	} -> Wait[corrupt[(i)]];((
+			[i == 0] (c01!proposalList.Get(i) -> Skip || c02!proposalList.Get(i) -> Skip || c03!proposalList.Get(i) -> Skip) []	
+			[i == 1] (c10!proposalList.Get(i) -> Skip || c12!proposalList.Get(i) -> Skip || c13!proposalList.Get(i) -> Skip) []
+			[i == 2] (c20!proposalList.Get(i) -> Skip || c21!proposalList.Get(i) -> Skip || c23!proposalList.Get(i) -> Skip) []
+			[i == 3] (c30!proposalList.Get(i) -> Skip || c31!proposalList.Get(i) -> Skip || c32!proposalList.Get(i) -> Skip)
+		); Skip)
+	[]
+	[i == 0 && i != leader] (if (leader == 1){c10?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c20?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c30?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+    [i == 1 && i != leader] (if (leader == 0){c01?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c21?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c31?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+    [i == 2 && i != leader] (if (leader == 0){c02?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 1){c12?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c32?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+	[i == 3 && i != leader] (if (leader == 0){c03?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 1){c13?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c23?y -> {proposalList.Set(i, y)} -> Skip});
+
+PrecommitRep(i) =
+	[i == 0] precommitVote -> Precommit_0(); (
+								if (leader == 0) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} }
+								else if (leader == 1) {(c01!tmpVote0 -> Skip) || (c01?y -> { precommitVote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c02!tmpVote0 -> Skip) || (c02?y -> { precommitVote2.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c03!tmpVote0 -> Skip) || (c03?y -> { precommitVote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 1] precommitVote -> Precommit_1(); (
+								if (leader == 1) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} }
+								else if (leader == 0) {(c10!tmpVote1 -> Skip) || (c10?y -> { precommitVote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c12!tmpVote1 -> Skip) || (c12?y -> { precommitVote2.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c13!tmpVote1 -> Skip) || (c13?y -> { precommitVote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 2] precommitVote -> Precommit_2(); (
+								if (leader == 2) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} }
+								else if (leader == 0) {(c20!tmpVote2 -> Skip) || (c20?y -> { precommitVote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 1) {(c21!tmpVote2 -> Skip) || (c21?y -> { precommitVote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 3) {(c23!tmpVote2 -> Skip) || (c23?y -> { precommitVote3.Add(y) } -> {voteCounter++;} -> Skip)}
+							)
+	[]
+	[i == 3] precommitVote -> Precommit_3(); (
+								if (leader == 3) { ifb(voteCounter == 3) {{voteCounter = 0}->Skip} }
+								else if (leader == 0) {(c30!tmpVote3 -> Skip) || (c30?y -> { precommitVote0.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 1) {(c31!tmpVote3 -> Skip) || (c31?y -> { precommitVote1.Add(y) } -> {voteCounter++;} -> Skip)}
+								else if (leader == 2) {(c32!tmpVote3 -> Skip) || (c32?y -> { precommitVote2.Add(y) } -> {voteCounter++;} -> Skip)}
+							);
+
+Precommit_0()= 
+	validateVote.0 {
+		tmpProposal0 = proposalList.Get(0); 
+		tmpProposedBlock0 = tmpProposal0.GetBlock();
+		var invalid = false;
+		if(chain0.Contains(tmpProposedBlock0)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock0 = new Block();
+		}
+		tmpVote0 = new Vote(tmpProposedBlock0.GetHash(), signature0);
+		precommitVote0.Add(tmpVote0);
+	} -> Skip;
+	
+Precommit_1() = 
+	validateVote.1 {
+		tmpProposal1 = proposalList.Get(1); 
+		tmpProposedBlock1 = tmpProposal1.GetBlock();
+		var invalid = false;
+		if(chain1.Contains(tmpProposedBlock1)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock1 = new Block();
+		}
+		tmpVote1 = new Vote(tmpProposedBlock1.GetHash(), signature1);
+		precommitVote1.Add(tmpVote1);
+	} -> Skip;
+	
+Precommit_2() = 
+	validateVote.2 {
+		tmpProposal2 = proposalList.Get(2); 
+		tmpProposedBlock2 = tmpProposal2.GetBlock();
+		var invalid = false;
+		if(chain2.Contains(tmpProposedBlock2)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock2 = new Block();
+		}
+		tmpVote2 = new Vote(tmpProposedBlock2.GetHash(), signature2);
+		precommitVote2.Add(tmpVote2);
+	} -> Skip;
+	
+Precommit_3() = 
+	validateVote.3 {
+		tmpProposal3 = proposalList.Get(3); 
+		tmpProposedBlock3 = tmpProposal3.GetBlock();
+		var invalid = false;
+		if(chain3.Contains(tmpProposedBlock3)){
+			invalid = true;
+		}
+		if(invalid) {
+			tmpProposedBlock3 = new Block();
+		}
+		tmpVote3 = new Vote(tmpProposedBlock3.GetHash(), signature3);
+		precommitVote3.Add(tmpVote3);
+	} -> Skip;
+
+
+/* Step 3 - Commit Phase: 验证者开始为该区块生成新的投票，表示他们同意将该区块提交到区块链中。领导者再度收集足够的投票并广播QC，确认区块已被提交。*/
+
+   
+CommitLeader(i) = 
+	[leader == i] precommitPost {
+		if(i == 0) {
+			tmpProposedBlock = precommitVote0.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(0)));// 需要改为qc而不是签名
+		};
+		if(i == 1) {
+			tmpProposedBlock = precommitVote1.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(1)));
+		};
+		if(i == 2) {
+			tmpProposedBlock = precommitVote2.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(2)));
+		};
+		if(i == 3) {
+			tmpProposedBlock = precommitVote3.GetFirstBlockWithMinSupport(MAJORITY);
+			proposalList.Set(i, new Proposal(tmpProposedBlock, new Signature(3)));
+		};
+	
+	} -> Wait[corrupt[(i)]];((	
+			[i == 0] (c01!proposalList.Get(i) -> Skip || c02!proposalList.Get(i) -> Skip || c03!proposalList.Get(i) -> Skip) []	
+			[i == 1] (c10!proposalList.Get(i) -> Skip || c12!proposalList.Get(i) -> Skip || c13!proposalList.Get(i) -> Skip) []
+			[i == 2] (c20!proposalList.Get(i) -> Skip || c21!proposalList.Get(i) -> Skip || c23!proposalList.Get(i) -> Skip) []
+			[i == 3] (c30!proposalList.Get(i) -> Skip || c31!proposalList.Get(i) -> Skip || c32!proposalList.Get(i) -> Skip)
+		); Skip)
+	[]
+	[i == 0 && i != leader] (if (leader == 1){c10?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c20?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c30?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+    [i == 1 && i != leader] (if (leader == 0){c01?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c21?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c31?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+    [i == 2 && i != leader] (if (leader == 0){c02?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 1){c12?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 3){c32?y -> {proposalList.Set(i, y)} -> Skip}) 
+	[]
+	[i == 3 && i != leader] (if (leader == 0){c03?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 1){c13?y -> {proposalList.Set(i, y)} -> Skip}else if(leader == 2){c23?y -> {proposalList.Set(i, y)} -> Skip});
+
+
+
+
+CommitRep(i) = 
+	[i == 0] addtoChain.i {
+		tmpProposal0 = proposalList.Get(0); 
+		tmpProposedBlock0 = tmpProposal0.GetBlock();
+		if(tmpProposedBlock0.GetHash() != -1) {
+			chain0.Add(tmpProposedBlock0)
+		}
+	} -> Skip
+	[]
+	[i == 1] addtoChain.i {
+		tmpProposal1 = proposalList.Get(1); 
+		tmpProposedBlock1 = tmpProposal1.GetBlock();
+		if(tmpProposedBlock1.GetHash() != -1) {
+			chain1.Add(tmpProposedBlock1)
+		}
+	} -> Skip
+	[]
+	[i == 2] addtoChain.i {
+		tmpProposal2 = proposalList.Get(2); 
+		tmpProposedBlock2 = tmpProposal2.GetBlock();
+		if(tmpProposedBlock2.GetHash() != -1) {
+			chain2.Add(tmpProposedBlock2)
+		}
+	} -> Skip
+	[]
+	[i == 3] addtoChain.i {
+		tmpProposal3 = proposalList.Get(3); 
+		tmpProposedBlock3 = tmpProposal3.GetBlock();
+		if(tmpProposedBlock3.GetHash() != -1) {
+			chain3.Add(tmpProposedBlock3)
+		}
+	} -> Skip;
+
+NextRound() = 
+	[round < R] setNextProposer {
+		corrupt[leader] = 0; //
+		round++;
+		leader = (leader+1) % N;
+		prevote0.Clear(); prevote1.Clear(); prevote2.Clear(); prevote3.Clear(); 
+		precommitVote0.Clear(); precommitVote1.Clear(); precommitVote2.Clear(); precommitVote3.Clear();
+	} -> BlockChain()
+	[]
+	[round >= R] Skip;
+
+BlockChain() = (Corrupt()|| (||x:{0..N-1}@(PrepareLeader(x);PrepareRep(x);PrecommitLeader(x);PrecommitRep(x);CommitLeader(x);CommitRep(x)))); NextRound();
+
+#define Consensus (!chain0.IsEmpty() && chain0.Peek() == chain1.Peek() && chain1.Peek() == chain2.Peek() && chain2.Peek() == chain3.Peek());
+
+#assert BlockChain() reaches Consensus;
+
+#assert BlockChain() deadlockfree;

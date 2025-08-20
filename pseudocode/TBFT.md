@@ -60,7 +60,7 @@ Function NewRound(nodeId, node, height, round)
 EndFunction
 ```
 
-### Algorithm: Mock Corrupt
+### Algorithm: Simulating Corrupt
 
 ```pseudo
 Function MockCorrupt(nodeId, node, height, round)
@@ -287,3 +287,4 @@ Function CommitBlock(nodeId, node)
             // Otherwise, proceed with processing the next block proposal
     EndIf
 EndFunction
+
